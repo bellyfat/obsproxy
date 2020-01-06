@@ -120,7 +120,7 @@ class Proxy:
             else:
                 buf_time = buf_size / avg_read
 
-            if loop_ct == 1:
+            if loop_ct == 3:
                 loop_ct = 0
                 logger.info(
                     "Recv: {:.2f} kbps, Send: {:.2f} kbps, Buffer: {:.2f} kB / {:.1f} s".format(
