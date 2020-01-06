@@ -14,15 +14,16 @@ class DisconnectError(Exception):
 
 
 class Proxy:
-    def __init__(self, downstream_reader, downstream_writer):
+    def __init__(self, downstream_reader, downstream_writer, max_buffer_size):
         self._downstream_reader = downstream_reader
         self._downstream_writer = downstream_writer
         self._upstream_reader = None
         self._upstream_writer = None
+        self._max_buffer_size = max_buffer_size
 
         self._buffer = bytearray()
-        self._lock = asyncio.Lock()
-        self._condition = asyncio.Condition()
+        self._buffer_data_condition = asyncio.Condition()
+        self._buffer_full_condition = asyncio.Condition()
 
         self._last_read_ct = 0
         self._last_write_ct = 0
@@ -35,6 +36,12 @@ class Proxy:
 
     async def _downstream_read_loop(self):
         while True:
+            # read only if there is room in the buffer
+            max_size = self._max_buffer_size - 512
+            while len(self._buffer) > max_size:
+                async with self._buffer_full_condition:
+                    await self._buffer_full_condition.wait()
+
             # Read data from downstream socket
             data = await self._downstream_reader.read(512)
 
@@ -42,45 +49,35 @@ class Proxy:
                 raise DisconnectError()
 
             # Place into buffer
-            async with self._lock:
-                self._buffer.extend(data)
-                self._last_read_ct += len(data)
+            self._buffer.extend(data)
+            self._last_read_ct += len(data)
 
             # Notify upstream loop that buffer has data
-            async with self._condition:
-                self._condition.notify(1)
+            async with self._buffer_data_condition:
+                self._buffer_data_condition.notify(1)
 
     async def _upstream_write_loop(self):
         while True:
             # wait for buffer to have data
-            async with self._condition:
-                await self._condition.wait()
-
-            async with self._lock:
-                buf_len = len(self._buffer)
-
-            if buf_len == 0:
-                continue
+            while len(self._buffer) == 0:
+                async with self._buffer_data_condition:
+                    await self._buffer_data_condition.wait()
 
             # Send data in the buffer as fast as we can
-            while buf_len > 0:
-                async with self._lock:
-                    buf_len = len(self._buffer)
-                    if buf_len == 0:
-                        continue
+            while len(self._buffer) > 0:
+                # write some data
+                data = self._buffer[:512]
 
-                    # write some data
-                    data = self._buffer[:512]
+                self._upstream_writer.write(data)
 
-                    self._upstream_writer.write(data)
-
-                    del self._buffer[: len(data)]
+                del self._buffer[: len(data)]
 
                 await self._upstream_writer.drain()
                 self._last_write_ct += len(data)
 
-                async with self._lock:
-                    buf_len = len(self._buffer)
+                if len(self._buffer) <= self._max_buffer_size - 512:
+                    async with self._buffer_full_condition:
+                        self._buffer_full_condition.notify_all()
 
     async def _upstream_read_loop(self):
         # Read from upstream and write to downstream
@@ -123,7 +120,7 @@ class Proxy:
             else:
                 buf_time = buf_size / avg_read
 
-            if loop_ct == 5:
+            if loop_ct == 1:
                 loop_ct = 0
                 logger.info(
                     "Recv: {:.2f} kbps, Send: {:.2f} kbps, Buffer: {:.2f} kB / {:.1f} s".format(
@@ -190,9 +187,11 @@ class Proxy:
 
 
 # Run a server to accept connections and start Proxy instances to handle them
-async def run_proxy(listen_host, listen_port, upstream_host, upstream_port):
+async def run_proxy(
+    listen_host, listen_port, upstream_host, upstream_port, max_buffer_size
+):
     async def conn_handler(reader, writer):
-        proxy = Proxy(reader, writer)
+        proxy = Proxy(reader, writer, max_buffer_size)
         try:
             await proxy.run(upstream_host, upstream_port)
         finally:
@@ -219,6 +218,12 @@ if __name__ == "__main__":
     parser.add_argument(
         "--upstream-port", type=int, default=1935, help="the stream service port"
     )
+    parser.add_argument(
+        "--max-buffer-size",
+        type=int,
+        default=10000,
+        help="the max buffer size, in kilobytes",
+    )
 
     args = parser.parse_args()
 
@@ -239,6 +244,7 @@ if __name__ == "__main__":
                 args.listen_port,
                 args.upstream_host,
                 args.upstream_port,
+                args.max_buffer_size * 1000,
             )
         )
     except KeyboardInterrupt:
