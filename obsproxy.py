@@ -3,6 +3,7 @@ import argparse
 import asyncio
 import logging
 import sys
+import time
 from asyncio import CancelledError
 
 logger = logging.getLogger(__name__)
@@ -23,6 +24,10 @@ class Proxy:
         self._lock = asyncio.Lock()
         self._condition = asyncio.Condition()
 
+        self._last_read_ct = 0
+        self._last_write_ct = 0
+        self._avg_bytes_sec = 0
+
     async def _connect_to_upstream(self, host, port):
         reader, writer = await asyncio.open_connection(host, port)
         self._upstream_reader = reader
@@ -39,6 +44,7 @@ class Proxy:
             # Place into buffer
             async with self._lock:
                 self._buffer.extend(data)
+                self._last_read_ct += len(data)
 
             # Notify upstream loop that buffer has data
             async with self._condition:
@@ -69,9 +75,12 @@ class Proxy:
                     self._upstream_writer.write(data)
 
                     del self._buffer[: len(data)]
-                    buf_len = len(self._buffer)
 
                 await self._upstream_writer.drain()
+                self._last_write_ct += len(data)
+
+                async with self._lock:
+                    buf_len = len(self._buffer)
 
     async def _upstream_read_loop(self):
         # Read from upstream and write to downstream
@@ -84,6 +93,50 @@ class Proxy:
             self._downstream_writer.write(data)
             await self._downstream_writer.drain()
 
+    async def _report_loop(self):
+        last_time = int(round(time.time() * 1000))
+        loop_ct = 0
+        while True:
+            await asyncio.sleep(1)
+            loop_ct += 1
+            now = int(round(time.time() * 1000))
+            diff = now - last_time
+            last_time = now
+
+            if self._last_read_ct == 0:
+                avg_read = 0
+            else:
+                avg_read = self._last_read_ct / (diff / 1000)
+
+            if self._last_write_ct == 0:
+                avg_write = 0
+            else:
+                avg_write = self._last_write_ct / (diff / 1000)
+
+            self._last_read_ct = 0
+            self._last_write_ct = 0
+            self._avg_bytes_sec = avg_read
+
+            buf_size = len(self._buffer)
+            if avg_read == 0:
+                buf_time = 0
+            else:
+                buf_time = buf_size / avg_read
+
+            if loop_ct == 5:
+                loop_ct = 0
+                logger.info(
+                    "Recv: {:.2f} kbps, Send: {:.2f} kbps, Buffer: {:.2f} kB / {:.1f} s".format(
+                        avg_read / 1000 * 8,
+                        avg_write / 1000 * 8,
+                        buf_size / 1000,
+                        buf_time,
+                    )
+                )
+
+                if buf_time >= 5:
+                    logger.warning("The buffer is very large!")
+
     async def run(self, host, port):
         # connect to upstream
         logger.info("Connecting to {}:{}".format(host, port))
@@ -92,34 +145,37 @@ class Proxy:
         async def msg():
             logger.info("Proxy started")
 
-        tasks = asyncio.gather(
+        coros = [
             self._upstream_write_loop(),
             self._upstream_read_loop(),
             self._downstream_read_loop(),
             msg(),
-        )
+            self._report_loop(),
+        ]
+        tasks = [asyncio.create_task(c) for c in coros]
+        gather = asyncio.gather(*tasks)
 
         try:
-            await tasks
+            await gather
         except DisconnectError:
             # A read operation returned 0 bytes (EOF)
             logger.info("Disconnected, stopping")
-            tasks.cancel()
+            [t.cancel() for t in tasks]
             await self._stop()
         except CancelledError:
             # Task was cancelled
-            tasks.cancel()
+            [t.cancel() for t in tasks]
             await self._stop()
             raise
         except KeyboardInterrupt:
             # Ctrl-C
-            tasks.cancel()
+            [t.cancel() for t in tasks]
             await self._stop()
             raise
         except IOError:
             # IO error, disconnect
             logger.info("Disconnected, stopping")
-            tasks.cancel()
+            [t.cancel() for t in tasks]
             await self._stop()
 
     async def _stop(self):
@@ -129,8 +185,7 @@ class Proxy:
                 await obj.wait_closed()
 
         await asyncio.gather(
-            closer(self._upstream_writer),
-            closer(self._downstream_writer),
+            closer(self._upstream_writer), closer(self._downstream_writer)
         )
 
 
