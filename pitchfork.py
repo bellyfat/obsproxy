@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+import argparse
 import asyncio
 import enum
 import functools
@@ -25,7 +26,7 @@ handler = logging.StreamHandler()
 handler.setFormatter(formatter)
 logger = logging.getLogger()
 logger.addHandler(handler)
-logger.setLevel(logging.DEBUG)
+logger.setLevel(logging.INFO)
 
 
 # Downstream
@@ -54,15 +55,19 @@ class DownstreamSession:
             writer.write(data)
             await writer.drain()
 
-        connect_tasks = [connect(i) for i in range(NUM_CONNECTIONS)]
+        connect_tasks = [
+            asyncio.create_task(connect(i)) for i in range(NUM_CONNECTIONS)
+        ]
         connect_task = asyncio.gather(*connect_tasks)
 
         # Try to connect all, cancel/close open connections if any fail
         try:
-            await connect_task
             logger.info("Opening connections to upstream")
+            await connect_task
         except Exception:
-            connect_task.cancel()
+            logger.error("Connection failed")
+            for task in connect_tasks:
+                task.cancel()
             conns = list(self._connections.values())
             for conn in conns:
                 conn.writer.close()
@@ -115,6 +120,7 @@ class DownstreamSession:
 
     async def run(self):
         await self._connect_upstream()
+
         tasks = [
             asyncio.create_task(self._read_from_upstream_loop()),
             asyncio.create_task(self._write_loop()),
@@ -136,7 +142,9 @@ class DownstreamSession:
 
             self._source_connection.writer.close()
             end_tasks.append(self._source_connection.writer.wait_closed())
-            all_tasks.cancel()
+            for task in all_tasks:
+                task.cancel()
+
             await asyncio.gather(*end_tasks)
             logger.info("Proxy session stopped")
 
@@ -165,6 +173,8 @@ class Downstream:
             pass
         finally:
             del self._sessions[sess.id]
+            writer.close()
+            await writer.wait_closed()
 
     async def start(self):
         logger.info("Starting proxy server")
@@ -208,9 +218,14 @@ class UpstreamSession:
 
     async def _connect_target(self):
         logger.info("Connecting to target")
-        reader, writer = await asyncio.open_connection(
-            self.target_host, self.target_port
-        )
+        try:
+            reader, writer = await asyncio.open_connection(
+                self.target_host, self.target_port
+            )
+        except Exception:
+            logger.error("Could not connect to target")
+            raise
+
         conn = Connection(reader, writer)
         self._target_conn = conn
 
@@ -263,7 +278,6 @@ class UpstreamSession:
                 self._read_idx_cond.notify_all()
 
     async def _read_upstream_loop(self):
-
         while self._target_conn is None or not self._all_connections:
             async with self._write_ready_cond:
                 await self._write_ready_cond.wait()
@@ -281,8 +295,6 @@ class UpstreamSession:
 
     async def add_connecion(self, conn, idx):
         if idx in self._connections or self._all_connections:
-            conn.writer.close()
-            await conn.writer.wait_closed()
             return
 
         self._connections[idx] = conn
@@ -341,11 +353,14 @@ class UpstreamSession:
         try:
             logger.info("Starting proxy session")
             await task
-        except Exception:
-            task.cancel()
+        except (OSError, EOFError, struct.error):
+            pass
+        finally:
+            self._run_task = None  # so we don't cancel ourself
+            for task in tasks:
+                task.cancel()
             await self._cancel_all()
             logger.info("Stopping proxy session")
-            raise
 
 
 class Upstream:
@@ -357,14 +372,19 @@ class Upstream:
 
         self._server = None
         self._sessions = {}
+        self._connections = {}
 
     async def _connected(self, reader, writer):
+        conn = Connection(reader, writer)
+        self._connections[conn] = conn
+
         try:
             # get connection data
             data = await reader.readexactly(ConnectionId.size)
             id_, idx = ConnectionId.unpack(data)
 
         except (OSError, EOFError, struct.error):
+            del self._connections[conn]
             writer.close()
             await writer.wait_closed()
             return
@@ -376,7 +396,6 @@ class Upstream:
             self._sessions[id_] = sess
 
         # Run session
-        conn = Connection(reader, writer)
 
         try:
             await sess.add_connecion(conn, idx)
@@ -385,6 +404,9 @@ class Upstream:
         finally:
             if id_ in self._sessions:
                 del self._sessions[id_]
+            del self._connections[conn]
+            conn.writer.close()
+            await conn.writer.wait_closed()
 
     async def start(self):
         logger.info("Starting proxy server")
@@ -400,4 +422,70 @@ class Upstream:
             for sess in self._sessions.values():
                 await sess.close()
 
+            for conn in self._connections.values():
+                conn.writer.close()
+                await conn.writer.wait_closed()
+
             logger.info("Server stopped")
+
+
+def run():
+    parser = argparse.ArgumentParser(description="Pitchfork proxy.")
+    subparsers = parser.add_subparsers(dest="component", required=True)
+
+    downstream_parser = subparsers.add_parser("downstream", help="downstream component")
+    downstream_parser.add_argument(
+        "--listen-host", type=str, help="the listen host", default="127.0.0.1"
+    )
+    downstream_parser.add_argument(
+        "--listen-port", type=int, help="the listen port", default=1935
+    )
+    downstream_parser.add_argument(
+        "--upstream-host", type=str, help="upstream host", required=True
+    )
+    downstream_parser.add_argument(
+        "--upstream-port", type=int, help="upstream port", default=8123
+    )
+
+    upstream_parser = subparsers.add_parser("upstream", help="upstream component")
+    upstream_parser.add_argument(
+        "--listen-host", type=str, help="the listen host", default="0.0.0.0"
+    )
+    upstream_parser.add_argument(
+        "--listen-port", type=int, help="the listen port", default=8123
+    )
+    upstream_parser.add_argument(
+        "--target-host", type=str, help="target host", required=True
+    )
+    upstream_parser.add_argument(
+        "--target-port", type=int, help="target port", default=1935
+    )
+
+    loop = asyncio.get_event_loop()
+
+    args = parser.parse_args()
+
+    if args.component == "downstream":
+        d = Downstream(
+            args.listen_host, args.listen_port, args.upstream_host, args.upstream_port
+        )
+
+        try:
+            loop.run_until_complete(d.start())
+        except KeyboardInterrupt:
+            print("")
+            pass
+
+    elif args.component == "upstream":
+        u = Upstream(
+            args.listen_host, args.listen_port, args.target_host, args.target_port
+        )
+        try:
+            loop.run_until_complete(u.start())
+        except KeyboardInterrupt:
+            print("")
+            pass
+
+
+if __name__ == "__main__":
+    run()
