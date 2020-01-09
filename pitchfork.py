@@ -1,17 +1,13 @@
 #!/usr/bin/env python3
 import argparse
 import asyncio
-import enum
-import functools
 import logging
 import os
-import random
 import struct
-import sys
 from collections import namedtuple
 from struct import Struct
 
-NUM_CONNECTIONS = 16
+NUM_CONNECTIONS = 25
 MAX_BUFFER_SIZE = 10 * 1e6
 READ_SIZE = 512
 MAX_WRITE_SIZE = 1200
@@ -87,6 +83,7 @@ class DownstreamSession:
             self._up_buffer.extend(data)
 
             if len(self._up_buffer) > MAX_BUFFER_SIZE:
+                logger.error("Buffer is full!")
                 raise BufferError("Buffer is full")
 
             if old_len == 0:
@@ -142,7 +139,7 @@ class DownstreamSession:
 
             self._source_connection.writer.close()
             end_tasks.append(self._source_connection.writer.wait_closed())
-            for task in all_tasks:
+            for task in tasks:
                 task.cancel()
 
             await asyncio.gather(*end_tasks)
