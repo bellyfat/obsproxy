@@ -4,11 +4,15 @@ import asyncio
 import logging
 import os
 import struct
+import time
 from collections import namedtuple
 from struct import Struct
 
+# needed for windows...
+import encodings.idna
+
 NUM_CONNECTIONS = 25
-MAX_BUFFER_SIZE = 10 * 1e6
+MAX_BUFFER_SIZE = 20 * 1e6
 READ_SIZE = 512
 MAX_WRITE_SIZE = 1200
 
@@ -40,6 +44,9 @@ class DownstreamSession:
 
         self._buffer_has_data_cond = asyncio.Condition()
 
+        self._read_ct = 0
+        self._write_ct = 0
+
     async def _connect_upstream(self):
         # open connections
         async def connect(i):
@@ -60,8 +67,8 @@ class DownstreamSession:
         try:
             logger.info("Opening connections to upstream")
             await connect_task
-        except Exception:
-            logger.error("Connection failed")
+        except Exception as e:
+            logger.warning("Connection failed: {}".format(e))
             for task in connect_tasks:
                 task.cancel()
             conns = list(self._connections.values())
@@ -79,11 +86,13 @@ class DownstreamSession:
             if len(data) == 0:
                 raise EOFError()
 
+            self._read_ct += len(data)
+
             old_len = len(self._up_buffer)
             self._up_buffer.extend(data)
 
             if len(self._up_buffer) > MAX_BUFFER_SIZE:
-                logger.error("Buffer is full!")
+                logger.warning("Buffer is full!")
                 raise BufferError("Buffer is full")
 
             if old_len == 0:
@@ -105,6 +114,7 @@ class DownstreamSession:
             conn.writer.write(out_data)
             write_idx = (write_idx + 1) % NUM_CONNECTIONS
             await conn.writer.drain()
+            self._write_ct += len(to_write)
 
     async def _read_from_upstream_loop(self):
         while True:
@@ -115,6 +125,46 @@ class DownstreamSession:
             self._source_connection.writer.write(data)
             await self._source_connection.writer.drain()
 
+    async def _info_loop(self):
+        while True:
+            start_t = time.time()
+            await asyncio.sleep(3)
+            end_t = time.time()
+
+            delta = end_t - start_t
+
+            if self._read_ct == 0:
+                read_avg = 0
+            else:
+                read_avg = self._read_ct / delta
+
+            if self._write_ct == 0:
+                write_avg = 0
+            else:
+                write_avg = self._write_ct / delta
+
+            buf_size = len(self._up_buffer)
+            buf_kb = buf_size / 1000
+            read_kbps = read_avg * 8 / 1000
+            write_kbps = write_avg * 8 / 1000
+            if read_avg == 0:
+                buf_time_str = "N/A s"
+            else:
+                buf_time = buf_size * 8 / 1000 / read_kbps
+                buf_time_str = "{:.1f} s".format(buf_time)
+
+            logger.info(
+                "Recv: {:.0f} kb/s, Send: {:.0f} kb/s, Buffer: {:.1f} kB, {}".format(
+                    read_kbps, write_kbps, buf_kb, buf_time_str
+                )
+            )
+
+            if buf_size > MAX_BUFFER_SIZE / 2:
+                logger.warning("Buffer is very large")
+
+            self._read_ct = 0
+            self._write_ct = 0
+
     async def run(self):
         await self._connect_upstream()
 
@@ -122,6 +172,7 @@ class DownstreamSession:
             asyncio.create_task(self._read_from_upstream_loop()),
             asyncio.create_task(self._write_loop()),
             asyncio.create_task(self._read_into_buffer_loop()),
+            asyncio.create_task(self._info_loop()),
         ]
 
         all_tasks = asyncio.gather(*tasks)
@@ -129,6 +180,15 @@ class DownstreamSession:
         try:
             logger.info("Starting proxy session")
             await all_tasks
+        except EOFError:
+            logger.warning("Upstream closed connection")
+            raise
+        except OSError as e:
+            logger.warning("Upstream disconnected: {}".format(e))
+            raise
+        except struct.error as e:
+            logger.warning("Invalid data: {}".format(e))
+            raise
         finally:
             logger.info("Stopping proxy session")
             end_tasks = []
