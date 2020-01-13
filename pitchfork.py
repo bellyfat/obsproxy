@@ -21,7 +21,7 @@ Connection = namedtuple("Connection", ("reader", "writer"))
 ConnectionId = Struct("<16sB")
 DataSegment = Struct("<H")
 
-formatter = logging.Formatter("%(message)s")
+formatter = logging.Formatter("%(asctime)s %(levelname)s: %(message)s")
 handler = logging.StreamHandler()
 handler.setFormatter(formatter)
 logger = logging.getLogger()
@@ -50,9 +50,19 @@ class DownstreamSession:
     async def _connect_upstream(self):
         # open connections
         async def connect(i):
-            reader, writer = await asyncio.open_connection(
-                self.upstream_host, self.upstream_port
-            )
+            exc = None
+            for _ in range(5):
+                try:
+                    reader, writer = await asyncio.open_connection(
+                        self.upstream_host, self.upstream_port
+                    )
+                    break
+                except OSError as e:
+                    exc = e
+                    continue
+            else:
+                raise exc
+
             self._connections[i] = Connection(reader, writer)
             data = ConnectionId.pack(self.id, i)
             writer.write(data)
@@ -84,6 +94,7 @@ class DownstreamSession:
         while True:
             data = await self._source_connection.reader.read(READ_SIZE)
             if len(data) == 0:
+                logger.warning("Source closed connection")
                 raise EOFError()
 
             self._read_ct += len(data)
@@ -120,6 +131,7 @@ class DownstreamSession:
         while True:
             data = await self._connections[0].reader.read(READ_SIZE)
             if len(data) == 0:
+                logger.warning("Upstream closed connection")
                 raise EOFError()
 
             self._source_connection.writer.write(data)
@@ -166,7 +178,18 @@ class DownstreamSession:
             self._write_ct = 0
 
     async def run(self):
-        await self._connect_upstream()
+        exc = None
+        for _ in range(5):
+            try:
+                await self._connect_upstream()
+                break
+            except OSError as e:
+                exc = e
+                logger.warning("Retrying upstream connection")
+                continue
+        else:
+            logger.error("Could not connect to upstream")
+            raise exc
 
         tasks = [
             asyncio.create_task(self._read_from_upstream_loop()),
@@ -181,7 +204,6 @@ class DownstreamSession:
             logger.info("Starting proxy session")
             await all_tasks
         except EOFError:
-            logger.warning("Upstream closed connection")
             raise
         except OSError as e:
             logger.warning("Upstream disconnected: {}".format(e))
@@ -234,10 +256,10 @@ class Downstream:
             await writer.wait_closed()
 
     async def start(self):
-        logger.info("Starting proxy server")
         self._server = await asyncio.start_server(
             self._connected, self.listen_host, self.listen_port
         )
+        logger.info("Started proxy server")
 
         try:
             await self._server.serve_forever()
