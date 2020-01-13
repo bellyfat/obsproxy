@@ -67,6 +67,7 @@ class DownstreamSession:
             data = ConnectionId.pack(self.id, i)
             writer.write(data)
             await writer.drain()
+            await reader.readexactly(1)
 
         connect_tasks = [
             asyncio.create_task(connect(i)) for i in range(NUM_CONNECTIONS)
@@ -301,8 +302,9 @@ class UpstreamSession:
             reader, writer = await asyncio.open_connection(
                 self.target_host, self.target_port
             )
-        except Exception:
-            logger.error("Could not connect to target")
+            logger.info("Target connected")
+        except Exception as e:
+            logger.error("Could not connect to target: {}".format(e))
             raise
 
         conn = Connection(reader, writer)
@@ -350,7 +352,11 @@ class UpstreamSession:
             write_data = buffer[:seg_size]
             del buffer[:seg_size]
             self._target_conn.writer.write(write_data)
-            await self._target_conn.writer.drain()
+            try:
+                await self._target_conn.writer.drain()
+            except OSError as e:
+                logger.warning("Upstream disconnected: {}".format(e))
+                raise
 
             self._read_idx = (self._read_idx + 1) % len(self._indices)
             async with self._read_idx_cond:
@@ -367,6 +373,7 @@ class UpstreamSession:
         while True:
             data = await self._target_conn.reader.read(READ_SIZE)
             if len(data) == 0:
+                logger.warning("Upstream closed connection")
                 raise EOFError()
 
             conn.writer.write(data)
@@ -387,9 +394,13 @@ class UpstreamSession:
         self._conn_tasks[idx] = task
 
         try:
+            conn.writer.write(b"\0")
+            await conn.writer.drain()
+
             logger.info("Added connection {}".format(idx))
             await task
         except Exception:
+            task.cancel()
             await self._cancel_all()
             raise
 
